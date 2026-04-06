@@ -1,0 +1,107 @@
+{
+  "kb_name": {
+    "description": "知识库名称，会显示在 AstrBot 官方知识库列表中",
+    "type": "string",
+    "default": "东方Project知识库"
+  },
+  "kb_description": {
+    "description": "知识库简介，用于说明这套知识库的来源和用途",
+    "type": "string",
+    "default": "从 THBWiki 备用站导入的东方Project设定知识"
+  },
+  "default_embedding_provider_id": {
+    "description": "默认向量模型 Provider ID。留空时会自动选择当前第一个可用的 Embedding Provider",
+    "type": "string",
+    "default": ""
+  },
+  "default_rerank_provider_id": {
+    "description": "默认重排模型 Provider ID。留空时会自动选择当前第一个可用的 Rerank Provider；如果未配置任何 Rerank Provider，则保持关闭",
+    "type": "string",
+    "default": ""
+  },
+  "default_entry_page": {
+    "description": "默认同步入口，可填写词条名或 THBWiki 页面 URL",
+    "type": "string",
+    "default": "东方Project"
+  },
+  "default_sync_limit": {
+    "description": "默认批量同步页数上限",
+    "type": "int",
+    "default": 40
+  },
+  "auto_sync_after_init": {
+    "description": "初始化后如果知识库为空，是否自动开始一次后台同步",
+    "type": "bool",
+    "default": true
+  },
+  "request_timeout_sec": {
+    "description": "单个页面抓取超时时间，单位为秒",
+    "type": "float",
+    "default": 20
+  },
+  "crawl_delay_ms": {
+    "description": "页面抓取间隔，单位为毫秒；适当调大可降低网络和站点压力",
+    "type": "int",
+    "default": 400
+  },
+  "http_user_agent": {
+    "description": "抓取 THBWiki 时使用的 User-Agent",
+    "type": "string",
+    "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+  },
+  "http_proxy": {
+    "description": "抓取时使用的 HTTP 代理地址，留空表示不使用代理",
+    "type": "string",
+    "default": ""
+  },
+  "pre_chunk_max_chars": {
+    "description": "预切片时每个文本块的最大字符数",
+    "type": "int",
+    "default": 1200
+  },
+  "pre_chunk_overlap": {
+    "description": "预切片时相邻文本块之间的重叠字符数",
+    "type": "int",
+    "default": 120
+  },
+  "sync_exclude_title_keywords": {
+    "description": "按标题关键词排除页面，支持逗号或换行分隔；适合过滤活动页、梗页、手游页等噪音内容",
+    "type": "string",
+    "default": "lostword\n大炮弹\n弹幕神乐\nPlay,Doujin!\nComic Market\n例大祭\n捏他列表\nBranching Paths\n啤酒\n黄昏酒场\n游戏为先还是酒为先\n二次创作以及使用规则"
+  },
+  "sync_exclude_category_keywords": {
+    "description": "按分类关键词排除页面，支持逗号或换行分隔；适合过滤现实人物、画师等非设定内容",
+    "type": "string",
+    "default": "现实人物\n同人画师\n授权商业二次创作手机游戏"
+  },
+  "upload_batch_size": {
+    "description": "单次向量化上传的文本块数量；模型服务不稳定时建议调小",
+    "type": "int",
+    "default": 4
+  },
+  "upload_tasks_limit": {
+    "description": "单次文档上传的并发任务数；如果容易报错或超时，建议保持为 1",
+    "type": "int",
+    "default": 1
+  },
+  "session_top_k": {
+    "description": "命中知识库时，最终返回给模型的内容块数量",
+    "type": "int",
+    "default": 5
+  },
+  "auto_bind_after_init": {
+    "description": "初始化、单页导入或同步完成后，是否自动绑定当前会话",
+    "type": "bool",
+    "default": false
+  },
+  "enable_routing_hint": {
+    "description": "检测到东方相关提问时，是否提示模型优先参考该知识库，并在命中人格绑定时自动补充检索结果",
+    "type": "bool",
+    "default": true
+  },
+  "remove_competing_tools": {
+    "description": "命中东方知识库路由时，是否临时移除 Python、网页搜索等竞争工具",
+    "type": "bool",
+    "default": true
+  }
+}

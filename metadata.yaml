@@ -1,0 +1,19 @@
+name: astrbot_plugin_touhou_kb
+display_name: 东方知识库
+desc: 将 THBWiki 备用站词条清洗后导入 AstrBot 官方知识库，支持会话绑定、人格绑定与东方话题优先路由
+help: |
+  常用指令：
+  1. /东方知识库初始化
+  2. /东方知识库状态
+  3. /东方知识库同步 [入口词条或URL] [页数]
+  4. /东方知识库绑定
+  5. /东方知识库绑定人格 [persona_id]
+author: YunMo-yanyu
+version: 0.3.0
+repo: https://github.com/YunMo-yanyu/astrbot-
+keywords:
+  - 东方Project
+  - THBWiki
+  - 知识库
+  - RAG
+  - 人格绑定
