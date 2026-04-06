@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import re
 import time
 import traceback
@@ -129,6 +130,8 @@ TOUHOU_LLM_HINT = (
     "Python 执行器或 Shell 工具来回答东方设定问题。"
 )
 PERSONA_BINDING_STORE_KEY = "touhou_kb_bound_persona_ids_v1"
+MAX_SESSION_TOP_K = 20
+MAX_CONTEXT_INJECTION_CHARS = 3000
 
 
 @dataclass
@@ -173,6 +176,7 @@ class Main(Star):
         self.session_last_task: dict[str, str] = {}
         self.background_jobs: dict[str, asyncio.Task] = {}
         self.global_last_task_id: str = ""
+        self._kb_write_lock = asyncio.Lock()
 
     def _cfg_str(self, key: str, default: str) -> str:
         value = self.config.get(key, default)
@@ -300,6 +304,15 @@ class Main(Star):
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned[:400]
 
+    def _normalize_top_k(self, top_k: int | None) -> int:
+        fallback = max(1, min(self._cfg_int("session_top_k", 5), MAX_SESSION_TOP_K))
+        if top_k is None:
+            return fallback
+        try:
+            return max(1, min(int(top_k), MAX_SESSION_TOP_K))
+        except (TypeError, ValueError):
+            return fallback
+
     def _sync_exclude_title_keywords(self) -> list[str]:
         return self._cfg_text_list(
             "sync_exclude_title_keywords",
@@ -356,7 +369,7 @@ class Main(Star):
         for tool_name in competing_tools:
             try:
                 request.func_tool.remove_tool(tool_name)
-            except Exception:
+            except (AttributeError, KeyError, ValueError):
                 continue
 
     async def _resolve_embedding_provider_id(self, preferred_id: str = "") -> str:
@@ -458,7 +471,7 @@ class Main(Star):
             chunk_overlap=50,
             top_k_dense=50,
             top_k_sparse=50,
-            top_m_final=self._cfg_int("session_top_k", 5),
+            top_m_final=self._normalize_top_k(None),
         )
         return kb_helper, True
 
@@ -483,9 +496,8 @@ class Main(Star):
 
         config = {
             "kb_ids": kb_ids,
-            "top_k": top_k if top_k is not None else current.get(
-                "top_k",
-                self._cfg_int("session_top_k", 5),
+            "top_k": self._normalize_top_k(
+                top_k if top_k is not None else current.get("top_k")
             ),
         }
         await sp.session_put(event.unified_msg_origin, "kb_config", config)
@@ -507,7 +519,7 @@ class Main(Star):
         ]
         config = {
             "kb_ids": kb_ids,
-            "top_k": current.get("top_k", self._cfg_int("session_top_k", 5)),
+            "top_k": self._normalize_top_k(current.get("top_k")),
         }
         await sp.session_put(event.unified_msg_origin, "kb_config", config)
         return config
@@ -611,12 +623,12 @@ class Main(Star):
             "kb_fusion_top_k",
             20,
         )
-        final_k = top_k if top_k is not None else self._cfg_int("session_top_k", 5)
+        final_k = self._normalize_top_k(top_k)
         return await self.context.kb_manager.retrieve(
             query=query,
             kb_names=[kb_name],
             top_k_fusion=max(1, int(fusion_k)),
-            top_m_final=max(1, int(final_k)),
+            top_m_final=final_k,
         )
 
     def _build_touhou_hint(self, active_source: str, persona_id: str | None) -> str:
@@ -713,6 +725,11 @@ class Main(Star):
         async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.get(url)
             response.raise_for_status()
+            final_host = (response.url.host or "").lower()
+            if final_host not in ALLOWED_HOSTS:
+                raise ValueError(
+                    f"页面重定向到了未允许的域名：{final_host or 'unknown'}"
+                )
             return response.text
 
     def _clean_text(self, text: str) -> str:
@@ -722,6 +739,22 @@ class Main(Star):
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = re.sub(r"[ \t]{2,}", " ", text)
         return text.strip()
+
+    def _truncate_injected_context(self, text: str) -> str:
+        cleaned = self._clean_text(text)
+        if len(cleaned) <= MAX_CONTEXT_INJECTION_CHARS:
+            return cleaned
+        truncated = cleaned[:MAX_CONTEXT_INJECTION_CHARS]
+        split_at = max(
+            truncated.rfind("\n\n"),
+            truncated.rfind("\n"),
+            truncated.rfind("。"),
+            truncated.rfind("！"),
+            truncated.rfind("？"),
+        )
+        if split_at >= int(MAX_CONTEXT_INJECTION_CHARS * 0.6):
+            truncated = truncated[: split_at + 1]
+        return truncated.rstrip() + "\n[内容已截断]"
 
     def _extract_categories(self, soup: BeautifulSoup) -> list[str]:
         categories: list[str] = []
@@ -902,23 +935,24 @@ class Main(Star):
         page: ParsedPage,
         existing_docs: dict[str, str],
     ) -> bool:
-        old_doc_id = existing_docs.get(page.title)
-        updated = False
-        if old_doc_id:
-            await kb_helper.delete_document(old_doc_id)
-            updated = True
+        async with self._kb_write_lock:
+            old_doc_id = existing_docs.get(page.title)
+            updated = False
+            if old_doc_id:
+                await kb_helper.delete_document(old_doc_id)
+                updated = True
 
-        doc = await kb_helper.upload_document(
-            file_name=page.title,
-            file_content=None,
-            file_type="txt",
-            batch_size=max(1, self._cfg_int("upload_batch_size", 4)),
-            tasks_limit=max(1, self._cfg_int("upload_tasks_limit", 1)),
-            max_retries=3,
-            pre_chunked_text=page.chunks,
-        )
-        existing_docs[page.title] = doc.doc_id
-        return updated
+            doc = await kb_helper.upload_document(
+                file_name=page.title,
+                file_content=None,
+                file_type="txt",
+                batch_size=max(1, self._cfg_int("upload_batch_size", 4)),
+                tasks_limit=max(1, self._cfg_int("upload_tasks_limit", 1)),
+                max_retries=3,
+                pre_chunked_text=page.chunks,
+            )
+            existing_docs[page.title] = doc.doc_id
+            return updated
 
     async def _maybe_auto_bind(
         self,
@@ -929,7 +963,7 @@ class Main(Star):
             await self._bind_session_to_kb(
                 event,
                 kb_helper.kb.kb_id,
-                self._cfg_int("session_top_k", 5),
+                self._normalize_top_k(None),
             )
 
     def _task_summary(self, task: SyncTask) -> str:
@@ -952,6 +986,12 @@ class Main(Star):
     def _has_running_sync_task(self) -> bool:
         return any(not job.done() for job in self.background_jobs.values())
 
+    def _get_running_sync_task(self) -> SyncTask | None:
+        for task_id, job in self.background_jobs.items():
+            if not job.done():
+                return self.sync_tasks.get(task_id)
+        return None
+
     def _start_sync_task(
         self,
         *,
@@ -960,6 +1000,11 @@ class Main(Star):
         event_umo: str | None = None,
         auto_bind_session: bool = False,
     ) -> SyncTask:
+        running_task = self._get_running_sync_task()
+        if running_task:
+            raise RuntimeError(
+                f"已有运行中的同步任务：{running_task.task_id}。请等待完成后再启动新的同步。"
+            )
         limit = max(1, min(limit, 500))
         task_id = uuid.uuid4().hex[:8]
         task = SyncTask(
@@ -1009,7 +1054,7 @@ class Main(Star):
         try:
             kb_helper, _ = await self._ensure_kb(preferred_provider_id)
             existing_docs = await self._load_existing_doc_map(kb_helper)
-            queue = [self._normalize_entry(task.entry)]
+            queue = deque([self._normalize_entry(task.entry)])
             queued = set(queue)
             visited: set[str] = set()
             delay = max(self._cfg_int("crawl_delay_ms", 400), 0) / 1000
@@ -1023,7 +1068,7 @@ class Main(Star):
             )
 
             while queue and (task.imported + task.updated + task.failed) < task.limit:
-                current_url = queue.pop(0)
+                current_url = queue.popleft()
                 queued.discard(current_url)
                 if current_url in visited:
                     continue
@@ -1040,7 +1085,7 @@ class Main(Star):
 
                 try:
                     html = await self._fetch_html(current_url)
-                    page = self._parse_page(current_url, html)
+                    page = await asyncio.to_thread(self._parse_page, current_url, html)
                     task.current_title = page.title
                     skip_reason = self._get_page_skip_reason(page)
                     if skip_reason:
@@ -1077,9 +1122,21 @@ class Main(Star):
                         ):
                             queue.append(link)
                             queued.add(link)
+                except asyncio.CancelledError:
+                    task.errors.append("同步任务已取消。")
+                    task.finish("cancelled", "同步任务已取消。")
+                    logger.info(
+                        "东方知识库后台同步取消: task_id=%s, imported=%s, updated=%s, failed=%s, discovered=%s",
+                        task.task_id,
+                        task.imported,
+                        task.updated,
+                        task.failed,
+                        task.discovered,
+                    )
+                    raise
                 except Exception as exc:
                     task.failed += 1
-                    detail = f"{current_url} -> {exc}"
+                    detail = f"{current_url} -> {type(exc).__name__}: {exc}"
                     task.errors.append(detail)
                     logger.warning(
                         "东方知识库同步失败: task_id=%s, detail=%s",
@@ -1119,12 +1176,11 @@ class Main(Star):
                     "kb_config",
                     {
                         "kb_ids": kb_ids,
-                        "top_k": current.get(
-                            "top_k",
-                            self._cfg_int("session_top_k", 5),
-                        ),
+                        "top_k": self._normalize_top_k(current.get("top_k")),
                     },
                 )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             logger.error(f"东方知识库后台同步失败: {exc}")
             logger.error(traceback.format_exc())
@@ -1166,7 +1222,9 @@ class Main(Star):
                 kb_name=kb_helper.kb.kb_name,
                 umo=event.unified_msg_origin,
             )
-            context_text = (kb_result or {}).get("context_text", "")
+            context_text = self._truncate_injected_context(
+                (kb_result or {}).get("context_text", "")
+            )
             if context_text and context_text not in request.system_prompt:
                 request.system_prompt += (
                     f"\n\n[Related Knowledge Base Results]:\n{context_text}"
@@ -1208,29 +1266,32 @@ class Main(Star):
                 and kb_helper.kb.chunk_count == 0
                 and not self._has_running_sync_task()
             ):
-                task = self._start_sync_task(
-                    entry=self._default_sync_entry(),
-                    limit=self._default_sync_limit(),
-                    event_umo=event.unified_msg_origin,
-                    auto_bind_session=False,
-                )
-                logger.info(
-                    "东方知识库初始化后自动启动同步: task_id=%s, entry=%s, limit=%s, kb=%s",
-                    task.task_id,
-                    task.entry,
-                    task.limit,
-                    kb_helper.kb.kb_name,
-                )
-                lines.extend(
-                    [
-                        "",
-                        "后台同步已自动启动：",
-                        f"任务ID：{task.task_id}",
-                        f"入口：{task.entry}",
-                        f"页数上限：{task.limit}",
-                        "可用 /东方知识库状态 或 /东方知识库任务 查看进度。",
-                    ]
-                )
+                try:
+                    task = self._start_sync_task(
+                        entry=self._default_sync_entry(),
+                        limit=self._default_sync_limit(),
+                        event_umo=event.unified_msg_origin,
+                        auto_bind_session=False,
+                    )
+                    logger.info(
+                        "东方知识库初始化后自动启动同步: task_id=%s, entry=%s, limit=%s, kb=%s",
+                        task.task_id,
+                        task.entry,
+                        task.limit,
+                        kb_helper.kb.kb_name,
+                    )
+                    lines.extend(
+                        [
+                            "",
+                            "后台同步已自动启动：",
+                            f"任务ID：{task.task_id}",
+                            f"入口：{task.entry}",
+                            f"页数上限：{task.limit}",
+                            "可用 /东方知识库状态 或 /东方知识库任务 查看进度。",
+                        ]
+                    )
+                except RuntimeError as exc:
+                    lines.extend(["", f"后台同步未启动：{exc}"])
             yield event.plain_result("\n".join(lines))
         except Exception as exc:
             yield event.plain_result(f"初始化失败：{exc}")
@@ -1245,11 +1306,16 @@ class Main(Star):
         if not kb_helper:
             yield event.plain_result("知识库还不存在，请先执行 /东方知识库初始化")
             return
-        config = await self._bind_session_to_kb(event, kb_helper.kb.kb_id, top_k)
+        normalized_top_k = self._normalize_top_k(top_k)
+        config = await self._bind_session_to_kb(
+            event,
+            kb_helper.kb.kb_id,
+            normalized_top_k,
+        )
         yield event.plain_result(
             f"已把当前会话绑定到 {kb_helper.kb.kb_name}\n"
             f"kb_ids：{', '.join(config.get('kb_ids', []))}\n"
-            f"top_k：{config.get('top_k', top_k)}"
+            f"top_k：{config.get('top_k', normalized_top_k)}"
         )
 
     @filter.command("东方知识库绑定人格")
@@ -1350,7 +1416,9 @@ class Main(Star):
             + ("是" if kb_helper and kb_helper.kb.kb_id in session_kb_ids else "否")
         )
         lines.append(f"当前会话 kb_ids：{session_kb_ids or []}")
-        lines.append(f"当前会话 top_k：{(kb_config or {}).get('top_k', '-')}")
+        lines.append(
+            f"当前会话 top_k：{self._normalize_top_k((kb_config or {}).get('top_k'))}"
+        )
         lines.append(f"当前生效人格：{binding_state['persona_id'] or '-'}")
         lines.append("当前人格已绑定：" + ("是" if binding_state["persona_bound"] else "否"))
         lines.append(f"已绑定人格列表：{binding_state['bound_persona_ids'] or []}")
@@ -1375,11 +1443,17 @@ class Main(Star):
         event: AstrMessageEvent,
         page: str = "东方Project",
     ):
+        running_task = self._get_running_sync_task()
+        if running_task:
+            yield event.plain_result(
+                f"当前有同步任务正在运行：{running_task.task_id}\n请等待同步完成后再执行单页导入。"
+            )
+            return
         try:
             kb_helper, _ = await self._ensure_kb()
             url = self._normalize_entry(page)
             html = await self._fetch_html(url)
-            parsed = self._parse_page(url, html)
+            parsed = await asyncio.to_thread(self._parse_page, url, html)
             skip_reason = self._get_page_skip_reason(parsed)
             if skip_reason:
                 yield event.plain_result(
@@ -1416,12 +1490,16 @@ class Main(Star):
         entry: str = "东方Project",
         limit: int = 40,
     ):
-        task = self._start_sync_task(
-            entry=entry or self._default_sync_entry(),
-            limit=limit,
-            event_umo=event.unified_msg_origin,
-            auto_bind_session=False,
-        )
+        try:
+            task = self._start_sync_task(
+                entry=entry or self._default_sync_entry(),
+                limit=limit,
+                event_umo=event.unified_msg_origin,
+                auto_bind_session=False,
+            )
+        except RuntimeError as exc:
+            yield event.plain_result(str(exc))
+            return
 
         yield event.plain_result(
             f"已开始同步任务：{task.task_id}\n"
@@ -1429,6 +1507,15 @@ class Main(Star):
             f"页数上限：{task.limit}\n"
             "可用 /东方知识库任务 查看进度。"
         )
+
+    async def terminate(self):
+        running_jobs = list(self.background_jobs.values())
+        for job in running_jobs:
+            if not job.done():
+                job.cancel()
+        if running_jobs:
+            await asyncio.gather(*running_jobs, return_exceptions=True)
+        self.background_jobs.clear()
 
     @filter.command("东方知识库任务")
     async def touhou_kb_task_status(
