@@ -20,9 +20,9 @@
     "default": ""
   },
   "default_entry_page": {
-    "description": "默认同步入口，可填写词条名或 THBWiki 页面 URL",
+    "description": "默认同步入口；核心清单按分组种子同步，也可填写单个词条或 URL",
     "type": "string",
-    "default": "东方Project"
+    "default": "核心清单"
   },
   "default_sync_limit": {
     "description": "每次同步最多请求的页面数（含被过滤或失败的页面），最大 500",
@@ -108,5 +108,50 @@
     "description": "单页最多允许的文本块数；超限时明确报错且不导入，避免意外导入巨型列表。不会截断正文",
     "type": "int",
     "default": 200
+  },
+  "core_seed_character": {
+    "description": "核心角色清单，逗号或换行分隔，可填写词条名或 URL；清空该组则不使用默认值",
+    "type": "string",
+    "default": "博丽灵梦\n雾雨魔理沙\n十六夜咲夜\n魂魄妖梦\n西行寺幽幽子\n八云紫\n蕾米莉亚·斯卡蕾特\n藤原妹红"
+  },
+  "core_seed_work": {
+    "description": "核心作品清单，逗号或换行分隔，可填写词条名或 URL；清空该组则不使用默认值",
+    "type": "string",
+    "default": "东方红魔乡\n东方妖妖梦\n东方永夜抄\n东方风神录"
+  },
+  "core_seed_location": {
+    "description": "核心地点清单，逗号或换行分隔，可填写词条名或 URL；清空该组则不使用默认值",
+    "type": "string",
+    "default": "幻想乡\n博丽神社\n红魔馆\n白玉楼\n永远亭"
+  },
+  "core_seed_organization": {
+    "description": "核心组织清单，逗号或换行分隔，可填写词条名或 URL；清空该组则不使用默认值",
+    "type": "string",
+    "default": ""
+  },
+  "core_seed_source": {
+    "description": "核心原作资料清单，逗号或换行分隔，可填写词条名或 URL；清空该组则不使用默认值",
+    "type": "string",
+    "default": "东方求闻史纪\n东方求闻口授"
+  },
+  "sync_max_depth": {
+    "description": "从核心词条或手动入口向外扩展的最大链接深度，0 只抓种子，默认 1，最大 3；所有请求共用页数预算",
+    "type": "int",
+    "default": 1
+  },
+  "sync_allowed_types": {
+    "description": "允许自动扩展导入的内容类型：character, work, location, organization, source；unknown 待分类、derivative 二创默认仅入候选，需确认后手动导入",
+    "type": "string",
+    "default": "character\nwork\nlocation\norganization\nsource"
+  },
+  "max_candidate_records": {
+    "description": "持久候选记录上限，20～5000，超限淘汰最旧记录，不影响已导入文档",
+    "type": "int",
+    "default": 1000
+  },
+  "record_missing_queries": {
+    "description": "记录东方知识库检索为空的问题用于按需补充。仅保存清洗后前 200 字及次数／时间，不保存用户或会话 ID；最多 100 条。管理员可查看，可关闭或清空",
+    "type": "bool",
+    "default": true
   }
 }

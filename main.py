@@ -125,6 +125,22 @@ TOUHOU_LLM_HINT = (
     "除非用户明确要求联网核验、抓网页、执行 Python 或写代码，否则不要优先改用网页搜索、浏览器抓取、"
     "Python 执行器或 Shell 工具来回答东方设定问题。"
 )
+CORE_ENTRY = "核心清单"
+CANDIDATE_STORE_KEY = "touhou_kb_candidates_v1"
+MISSING_QUERY_STORE_KEY = "touhou_kb_missing_queries_v1"
+CONTENT_TYPE_LABELS = {
+    "character": "角色", "work": "作品", "location": "地点",
+    "organization": "组织", "source": "原作资料", "derivative": "二创", "unknown": "待分类",
+}
+DEFAULT_CORE_SEEDS = {
+    "character": ("博丽灵梦", "雾雨魔理沙", "十六夜咲夜", "魂魄妖梦", "西行寺幽幽子", "八云紫", "蕾米莉亚·斯卡蕾特", "藤原妹红"),
+    "work": ("东方红魔乡", "东方妖妖梦", "东方永夜抄", "东方风神录"),
+    "location": ("幻想乡", "博丽神社", "红魔馆", "白玉楼", "永远亭"),
+    "organization": (),
+    "source": ("东方求闻史纪", "东方求闻口授"),
+}
+DEFAULT_ALLOWED_TYPES = ("character", "work", "location", "organization", "source")
+
 PERSONA_BINDING_STORE_KEY = "touhou_kb_bound_persona_ids_v1"
 MAX_SESSION_TOP_K = 20
 MAX_CONTEXT_INJECTION_CHARS = 3000
@@ -140,6 +156,9 @@ class SyncTask:
     current_url: str = ""
     current_title: str = ""
     discovered: int = 0
+    requested: int = 0
+    skipped: int = 0
+    pending: int = 0
     imported: int = 0
     updated: int = 0
     failed: int = 0
@@ -173,6 +192,7 @@ class Main(Star):
         self.background_jobs: dict[str, asyncio.Task] = {}
         self.global_last_task_id: str = ""
         self._kb_write_lock = asyncio.Lock()
+        self._policy_store_lock = asyncio.Lock()
 
     def _cfg_str(self, key: str, default: str) -> str:
         value = self.config.get(key, default)
@@ -210,7 +230,7 @@ class Main(Star):
         )
 
     def _default_sync_entry(self) -> str:
-        return self._cfg_str("default_entry_page", "东方Project")
+        return self._cfg_str("default_entry_page", CORE_ENTRY)
 
     def _default_sync_limit(self) -> int:
         return max(1, min(self._cfg_int("default_sync_limit", 40), 500))
@@ -320,6 +340,75 @@ class Main(Star):
             "sync_exclude_category_keywords",
             DEFAULT_SYNC_EXCLUDE_CATEGORY_KEYWORDS,
         )
+
+    def _core_seed_map(self) -> dict[str, str]:
+        seeds: dict[str, str] = {}
+        for content_type, defaults in DEFAULT_CORE_SEEDS.items():
+            for entry in self._cfg_text_list(f"core_seed_{content_type}", defaults):
+                # Resolve both URL and title entries to the same title key.
+                url = self._normalize_entry(entry)
+                title = unquote(urlparse(url).path.strip("/")).replace("_", " ")
+                seeds.setdefault(title, content_type)
+        return seeds
+
+    def _classify_page(self, title: str, categories: list[str]) -> tuple[str, str]:
+        seed_type = self._core_seed_map().get(title.replace("_", " "))
+        # Category rules are conservative hints, not a complete THBWiki taxonomy.
+        rules = (
+            ("derivative", ("二次创作", "同人作品", "同人游戏", "同人角色", "同人社团")),
+            ("source", ("官方资料", "原作资料", "设定文档", "官方出版物")),
+            ("character", ("角色", "人物")),
+            ("location", ("地点", "地理", "场所")),
+            ("organization", ("组织", "势力")),
+            ("work", ("官方游戏", "官方作品")),
+        )
+        for content_type, keywords in rules:
+            for category in categories:
+                if any(word in category for word in keywords):
+                    # Explicit seeds may supply a type, but do not override a
+                    # derivative category or configured exclusion rules.
+                    if seed_type and content_type != "derivative":
+                        return seed_type, "核心清单声明"
+                    return content_type, f"分类线索：{category}"
+        if seed_type:
+            return seed_type, "核心清单声明"
+        parent, sep, suffix = title.partition("/")
+        if sep and parent in self._core_seed_map() and suffix in {"设定", "设定文档", "官方资料", "角色介绍"}:
+            return "source", "核心词条的资料子页标题（启发式）"
+        return "unknown", "缺少明确分类线索，等待人工确认"
+
+    def _allowed_sync_types(self) -> set[str]:
+        return set(self._cfg_text_list("sync_allowed_types", DEFAULT_ALLOWED_TYPES)) & set(CONTENT_TYPE_LABELS)
+
+    async def _read_candidates(self) -> dict[str, dict[str, Any]]:
+        raw = await self.get_kv_data(CANDIDATE_STORE_KEY, {})
+        return {url: value for url, value in raw.items() if isinstance(value, dict)} if isinstance(raw, dict) else {}
+
+    async def _save_candidates(self, updates: dict[str, dict[str, Any]]) -> None:
+        if not updates:
+            return
+        async with self._policy_store_lock:
+            records = await self._read_candidates()
+            for url, item in updates.items():
+                # Rediscovering a link is not a new review of an imported page.
+                if item.get("reason", "").startswith("待分类／") and records.get(url, {}).get("status") == "imported":
+                    continue
+                records[url] = item
+            cap = max(20, min(self._cfg_int("max_candidate_records", 1000), 5000))
+            newest = sorted(records.items(), key=lambda item: item[1].get("updated_at", 0), reverse=True)[:cap]
+            await self.put_kv_data(CANDIDATE_STORE_KEY, dict(newest))
+
+    async def _record_missing_query(self, query: str) -> None:
+        if not query or not self._cfg_bool("record_missing_queries", True):
+            return
+        async with self._policy_store_lock:
+            records = await self.get_kv_data(MISSING_QUERY_STORE_KEY, {})
+            records = records if isinstance(records, dict) else {}
+            query = query[:200]
+            previous = records.get(query, {})
+            records[query] = {"count": int(previous.get("count", 0)) + 1, "updated_at": time.time()}
+            recent = sorted(records.items(), key=lambda item: item[1].get("updated_at", 0), reverse=True)[:100]
+            await self.put_kv_data(MISSING_QUERY_STORE_KEY, dict(recent))
 
     def _find_excluded_keyword(
         self,
@@ -664,7 +753,8 @@ class Main(Star):
         parsed = urlparse(url)
         if parsed.netloc not in ALLOWED_HOSTS:
             raise ValueError("只支持 thbwiki.cc / www.thbwiki.cc 下的页面。")
-        return parsed._replace(query="", fragment="").geturl()
+        path = quote(unquote(parsed.path).replace("_", " "), safe="/()（）-_")
+        return parsed._replace(scheme="https", netloc="thbwiki.cc", path=path, query="", fragment="").geturl()
 
     def _is_supported_article_url(self, url: str) -> bool:
         parsed = urlparse(url)
@@ -828,7 +918,10 @@ class Main(Star):
     ) -> list[str]:
         max_chars = max(self._cfg_int("pre_chunk_max_chars", 1200), 300)
         overlap = max(self._cfg_int("pre_chunk_overlap", 120), 0)
-        prefix_lines = [f"词条：{title}", f"来源：{url}"]
+        content_type, _ = self._classify_page(title, categories)
+        priority = "核心" if title.replace("_", " ") in self._core_seed_map() else "按需"
+        prefix_lines = [f"词条：{title}", f"来源：{url}",
+                        f"类型：{CONTENT_TYPE_LABELS[content_type]}；收录优先级：{priority}"]
         if categories:
             prefix_lines.append(f"分类：{'、'.join(categories)}")
         prefix = "\n".join(prefix_lines)
@@ -882,6 +975,7 @@ class Main(Star):
             candidate = urlparse(candidate)._replace(query="", fragment="").geturl()
             if not self._is_supported_article_url(candidate):
                 continue
+            candidate = self._normalize_entry(candidate)
             if candidate not in seen_links:
                 seen_links.add(candidate)
                 links.append(candidate)
@@ -999,6 +1093,8 @@ class Main(Star):
             f"已更新：{task.updated}\n"
             f"失败：{task.failed}\n"
             f"已发现：{task.discovered}\n"
+            f"已请求：{task.requested} / {task.limit}\n"
+            f"已跳过：{task.skipped}；已请求页面中待确认：{task.pending}\n"
             f"当前页面：{task.current_title or '-'}\n"
             f"当前URL：{task.current_url or '-'}\n"
             f"开始时间：{self._now_text(task.started_at)}\n"
@@ -1074,11 +1170,21 @@ class Main(Star):
         auto_bind_session: bool = False,
         preferred_provider_id: str = "",
     ) -> None:
+        candidate_updates: dict[str, dict[str, Any]] = {}
         try:
             kb_helper, _ = await self._ensure_kb(preferred_provider_id)
             existing_docs = await self._load_existing_doc_map(kb_helper)
-            queue = deque([self._normalize_entry(task.entry)])
-            queued = set(queue)
+            seed_entries = list(self._core_seed_map()) if task.entry == CORE_ENTRY else [task.entry]
+            if not seed_entries:
+                raise ValueError("核心清单为空，请先配置核心词条或指定单个入口。")
+            # Put every explicit seed ahead of all discovered links.
+            seed_urls = list(dict.fromkeys(self._normalize_entry(entry) for entry in seed_entries))
+            if len(seed_urls) > 500:
+                raise ValueError("核心清单超过 500 个词条，请精简清单或分批同步。")
+            queue = deque((url, 0, "核心清单" if task.entry == CORE_ENTRY else "手动入口") for url in seed_urls)
+            queued = set(seed_urls)
+            max_depth = max(0, min(self._cfg_int("sync_max_depth", 1), 3))
+            allowed_types = self._allowed_sync_types()
             visited: set[str] = set()
             delay = max(self._cfg_int("crawl_delay_ms", 400), 0) / 1000
             task.status = "running"
@@ -1091,11 +1197,12 @@ class Main(Star):
             )
 
             while queue and len(visited) < task.limit:
-                current_url = queue.popleft()
+                current_url, depth, discovered_from = queue.popleft()
                 queued.discard(current_url)
                 if current_url in visited:
                     continue
                 visited.add(current_url)
+                task.requested = len(visited)
                 task.discovered = len(visited) + len(queue)
                 task.current_url = current_url
                 logger.info(
@@ -1106,19 +1213,38 @@ class Main(Star):
                     current_url,
                 )
 
+                candidate_updates[current_url] = {
+                    "title": unquote(urlparse(current_url).path.strip("/")),
+                    "content_type": "unknown", "priority": "核心" if task.entry == CORE_ENTRY else "按需",
+                    "depth": depth, "discovered_from": discovered_from,
+                    "reason": "已请求，等待解析", "status": "pending", "updated_at": time.time(),
+                }
                 try:
                     html = await self._fetch_html(current_url)
                     page = await asyncio.to_thread(self._parse_page, current_url, html)
                     task.current_title = page.title
+                    content_type, classification_reason = self._classify_page(page.title, page.categories)
                     skip_reason = self._get_page_skip_reason(page)
-                    if skip_reason:
-                        logger.info(
-                            "东方知识库同步跳过页面: task_id=%s, title=%s, reason=%s, url=%s",
-                            task.task_id,
-                            page.title,
-                            skip_reason,
-                            current_url,
-                        )
+                    # Explicit seeds/entries are an operator's selection. Linked
+                    # pages must pass the content-type gate before vectorization.
+                    policy_reason = ""
+                    if depth > 0 and content_type not in allowed_types:
+                        policy_reason = f"扩展类型未允许：{CONTENT_TYPE_LABELS[content_type]}"
+                    if depth == 0 and content_type == "derivative" and content_type not in allowed_types:
+                        policy_reason = "二创类型默认不收录"
+                    record = {
+                        "title": page.title, "content_type": content_type,
+                        "priority": "核心" if (task.entry == CORE_ENTRY and depth == 0) or page.title in self._core_seed_map() else "按需",
+                        "depth": depth, "discovered_from": discovered_from,
+                        "reason": skip_reason or policy_reason or classification_reason,
+                        "status": "excluded" if skip_reason else "pending" if policy_reason else "imported",
+                        "updated_at": time.time(),
+                    }
+                    candidate_updates[current_url] = record
+                    if skip_reason or policy_reason:
+                        task.skipped += 1
+                        if policy_reason and not skip_reason:
+                            task.pending += 1
                         if delay > 0:
                             await asyncio.sleep(delay)
                         continue
@@ -1140,13 +1266,24 @@ class Main(Star):
                     )
 
                     for link in page.links:
-                        if (
-                            link not in visited
-                            and link not in queued
-                            and len(visited) + len(queue) < task.limit * 4
-                        ):
-                            queue.append(link)
+                        if not self._is_supported_article_url(link) or link in visited or link in queued:
+                            continue
+                        if len(candidate_updates) >= 5000:
+                            break
+                        link_title = unquote(urlparse(link).path.strip("/"))
+                        title_skip = self._find_excluded_keyword(link_title, self._sync_exclude_title_keywords())
+                        candidate_updates.setdefault(link, {
+                            "title": link_title, "content_type": "unknown", "priority": "按需",
+                            "depth": depth + 1, "discovered_from": page.title,
+                            "reason": f"标题命中排除词：{title_skip}" if title_skip else "待分类／超出扩展深度或请求预算",
+                            "status": "excluded" if title_skip else "pending", "updated_at": time.time(),
+                        })
+                        if not title_skip and depth < max_depth and len(visited) + len(queue) < task.limit * 4:
+                            queue.append((link, depth + 1, page.title))
                             queued.add(link)
+                    # Checkpoint after each page, including discovered links.
+                    await self._save_candidates(candidate_updates)
+                    candidate_updates.clear()
                 except asyncio.CancelledError:
                     task.errors.append("同步任务已取消。")
                     task.finish("cancelled", "同步任务已取消。")
@@ -1161,6 +1298,9 @@ class Main(Star):
                     raise
                 except Exception as exc:
                     task.failed += 1
+                    if current_url in candidate_updates:
+                        candidate_updates[current_url]["status"] = "failed"
+                        candidate_updates[current_url]["reason"] = str(exc)[:300]
                     detail = f"{current_url} -> {type(exc).__name__}: {exc}"
                     task.errors.append(detail)
                     logger.warning(
@@ -1172,8 +1312,10 @@ class Main(Star):
                 if delay > 0:
                     await asyncio.sleep(delay)
 
+            await self._save_candidates(candidate_updates)
             message = (
-                f"同步完成，新增 {task.imported} 页，更新 {task.updated} 页，失败 {task.failed} 页。"
+                f"已请求 {task.requested} 页，跳过 {task.skipped} 页；同步完成，新增 {task.imported} 页，更新 {task.updated} 页，失败 {task.failed} 页。"
+                + (f" 请求预算已用完，仍有 {len(queue)} 个已排队页面未抓取。" if queue else "")
             )
             task.finish("completed", message)
             logger.info(
@@ -1205,6 +1347,8 @@ class Main(Star):
                     },
                 )
         except asyncio.CancelledError:
+            await self._save_candidates(candidate_updates)
+            task.finish("cancelled", "同步任务已取消。")
             raise
         except Exception as exc:
             logger.error(f"东方知识库后台同步失败: {exc}")
@@ -1251,6 +1395,11 @@ class Main(Star):
             context_text = self._truncate_injected_context(
                 (kb_result or {}).get("context_text", "")
             )
+            if not context_text:
+                try:
+                    await self._record_missing_query(query)
+                except Exception as exc:
+                    logger.warning("记录东方知识库待补充问题失败: %s", exc)
             if context_text and context_text not in request.system_prompt:
                 request.system_prompt += (
                     f"\n\n[Related Knowledge Base Results]:\n{context_text}"
@@ -1499,6 +1648,13 @@ class Main(Star):
             existing_docs = await self._load_existing_doc_map(kb_helper)
             was_updated = await self._upsert_page(kb_helper, parsed, existing_docs)
             await self._maybe_auto_bind(event, kb_helper)
+            content_type, _ = self._classify_page(parsed.title, parsed.categories)
+            await self._save_candidates({parsed.url: {
+                "title": parsed.title, "content_type": content_type,
+                "priority": "核心" if parsed.title in self._core_seed_map() else "按需",
+                "depth": 0, "discovered_from": "手动单页导入", "reason": "用户明确选择词条",
+                "status": "imported", "updated_at": time.time(),
+            }})
             action = "更新" if was_updated else "导入"
             logger.info(
                 "东方知识库单页导入完成: action=%s, title=%s, url=%s, chunks=%s, kb=%s",
@@ -1521,13 +1677,13 @@ class Main(Star):
     async def sync_touhou_pages(
         self,
         event: AstrMessageEvent,
-        entry: str = "东方Project",
-        limit: int = 40,
+        entry: str = "",
+        limit: int = 0,
     ):
         try:
             task = self._start_sync_task(
                 entry=entry or self._default_sync_entry(),
-                limit=limit,
+                limit=limit if limit > 0 else self._default_sync_limit(),
                 event_umo=event.unified_msg_origin,
                 auto_bind_session=False,
             )
@@ -1541,6 +1697,52 @@ class Main(Star):
             f"页数上限：{task.limit}\n"
             "可用 /东方知识库任务 查看进度。"
         )
+
+    @filter.command("东方知识库核心清单")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_core_seeds(self, event: AstrMessageEvent):
+        seeds = self._core_seed_map()
+        lines = [f"核心词条：{len(seeds)} 个；扩展深度：{max(0, min(self._cfg_int('sync_max_depth', 1), 3))}"]
+        for content_type in DEFAULT_CORE_SEEDS:
+            titles = [title for title, kind in seeds.items() if kind == content_type]
+            lines.append(f"{CONTENT_TYPE_LABELS[content_type]}：{'、'.join(titles) or '（空）'}")
+        lines.append("可在插件设置编辑各组核心清单；同步命令：/东方知识库同步 核心清单")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("东方知识库候选")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_sync_candidates(self, event: AstrMessageEvent, status: str = "pending"):
+        records = await self._read_candidates()
+        if status not in {"pending", "excluded", "imported", "failed", "all"}:
+            yield event.plain_result("状态可选：pending / excluded / imported / failed / all")
+            return
+        matching = [(url, item) for url, item in records.items() if status == "all" or item.get("status") == status]
+        lines = [f"候选记录：{len(matching)} 条（最多显示 20 条）"]
+        for url, item in matching[:20]:
+            lines.append(f"{item.get('title', '-')} | {CONTENT_TYPE_LABELS.get(item.get('content_type'), '待分类')} | {item.get('status')}\n"
+                         f"来源：{item.get('discovered_from', '-')}；深度：{item.get('depth', '-')}\n"
+                         f"原因：{item.get('reason', '-')}\n{url}")
+        lines.append("确认需要后，用 /东方知识库导入 词条名 单页导入，或加入对应核心清单后同步。")
+        yield event.plain_result("\n\n".join(lines))
+
+    @filter.command("东方知识库待补充")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def list_missing_queries(self, event: AstrMessageEvent):
+        records = await self.get_kv_data(MISSING_QUERY_STORE_KEY, {})
+        records = records if isinstance(records, dict) else {}
+        ranked = sorted(records.items(), key=lambda item: item[1].get("count", 0), reverse=True)
+        lines = ["检索为空的问题（只表示未返回文本，不代表确认缺少资料）："]
+        lines.extend(f"{item.get('count', 0)} 次：{query}" for query, item in ranked[:20])
+        if not ranked:
+            lines.append("暂无记录。")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("东方知识库清空待补充")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def clear_missing_queries(self, event: AstrMessageEvent):
+        async with self._policy_store_lock:
+            await self.put_kv_data(MISSING_QUERY_STORE_KEY, {})
+        yield event.plain_result("已清空待补充问题记录。")
 
     async def terminate(self):
         running_jobs = list(self.background_jobs.values())
