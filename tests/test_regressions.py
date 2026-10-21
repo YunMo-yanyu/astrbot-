@@ -25,6 +25,7 @@ def load_plugin():
             setattr(module, attr, type(attr, (), {}))
         modules[name] = module
     class Filters:
+        PermissionType = types.SimpleNamespace(ADMIN="admin")
         def __getattr__(self, name):
             return lambda *a, **kw: lambda fn: fn
     modules['astrbot.api.event'].filter = Filters()
@@ -43,6 +44,14 @@ class RegressionTests(unittest.TestCase):
         self.main = object.__new__(plugin.Main)
         self.main.config = {}
         self.main._kb_write_lock = asyncio.Lock()
+        self.main._policy_store_lock = asyncio.Lock()
+        self.records = {}
+        async def get(key, default=None):
+            return self.records.get(key, default)
+        async def put(key, value):
+            self.records[key] = value
+        self.main.get_kv_data = AsyncMock(side_effect=get)
+        self.main.put_kv_data = AsyncMock(side_effect=put)
 
     def parse(self, body):
         return self.main._parse_page('https://thbwiki.cc/博丽灵梦',

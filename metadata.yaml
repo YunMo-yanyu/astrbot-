@@ -5,11 +5,14 @@ help: |
   常用指令：
   1. /东方知识库初始化
   2. /东方知识库状态
-  3. /东方知识库同步 [入口词条或URL] [页数]
+  3. /东方知识库同步 核心清单 [页数]
   4. /东方知识库绑定
   5. /东方知识库绑定人格 [persona_id]
+  6. /东方知识库核心清单
+  7. /东方知识库候选
+  8. /东方知识库待补充
 author: YunMo-yanyu
-version: 0.3.1
+version: 0.4.0
 repo: https://github.com/YunMo-yanyu/astrbot-
 keywords:
   - 东方Project
