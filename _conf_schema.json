@@ -25,7 +25,7 @@
     "default": "东方Project"
   },
   "default_sync_limit": {
-    "description": "默认批量同步页数上限",
+    "description": "每次同步最多请求的页面数（含被过滤或失败的页面），最大 500",
     "type": "int",
     "default": 40
   },
@@ -103,5 +103,10 @@
     "description": "命中东方知识库路由时，是否临时移除 Python、网页搜索等竞争工具",
     "type": "bool",
     "default": true
+  },
+  "max_page_chunks": {
+    "description": "单页最多允许的文本块数；超限时明确报错且不导入，避免意外导入巨型列表。不会截断正文",
+    "type": "int",
+    "default": 200
   }
 }

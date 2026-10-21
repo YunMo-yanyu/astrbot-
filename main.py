@@ -42,12 +42,8 @@ REMOVE_SELECTORS = (
     ".printfooter",
     ".reference",
     ".mw-references-wrap",
-    ".thumb",
-    ".gallery",
     ".navbox",
     ".vertical-navbox",
-    ".metadata",
-    ".noprint",
     ".mw-cite-backlink",
     ".mw-cite-backlink",
 )
@@ -796,6 +792,8 @@ class Main(Star):
 
     def _hard_split_text(self, text: str, limit: int, overlap: int) -> list[str]:
         chunks: list[str] = []
+        limit = max(1, limit)
+        overlap = max(0, min(overlap, limit // 4))
         start = 0
         text = text.strip()
         if not text:
@@ -891,23 +889,37 @@ class Main(Star):
         sections: list[tuple[str, str]] = []
         current_heading = "概述"
         current_lines: list[str] = []
-        for child in root.children:
-            if isinstance(child, NavigableString):
-                continue
-            if not isinstance(child, Tag):
-                continue
-            if child.name in {"h2", "h3", "h4"}:
-                heading = self._clean_text(child.get_text(" ", strip=True))
-                if heading in STOP_SECTION_TITLES:
-                    break
+        skipped_level: int | None = None
+
+        def blocks(node: Tag):
+            # Wiki templates and newer MediaWiki versions wrap headings and
+            # paragraphs in div/section nodes. Traverse wrappers without
+            # flattening whole sections or dropping their bare text.
+            for child in node.children:
+                if isinstance(child, NavigableString):
+                    text = self._clean_text(str(child))
+                    if text:
+                        yield None, text
+                elif isinstance(child, Tag):
+                    if child.name in {"div", "section", "article"}:
+                        yield from blocks(child)
+                    else:
+                        yield child, self._extract_block_text(child)
+
+        for child, block_text in blocks(root):
+            if child is not None and child.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+                level = int(child.name[1])
+                heading = block_text
+                if skipped_level is not None and level > skipped_level:
+                    continue
                 body = self._clean_text("\n\n".join(current_lines))
                 if body:
                     sections.append((current_heading, body))
-                current_heading = heading or current_heading
                 current_lines = []
+                skipped_level = level if heading in STOP_SECTION_TITLES else None
+                current_heading = heading or current_heading
                 continue
-            block_text = self._extract_block_text(child)
-            if block_text:
+            if skipped_level is None and block_text:
                 current_lines.append(block_text)
 
         body = self._clean_text("\n\n".join(current_lines))
@@ -916,10 +928,14 @@ class Main(Star):
 
         chunks = self._build_chunks(title, url, categories, sections)
         if not chunks:
-            fallback = self._clean_text(root.get_text("\n", strip=True))
-            chunks = self._build_chunks(title, url, categories, [("正文", fallback)])
-        if not chunks:
             raise ValueError(f"页面正文为空，无法导入: {title}")
+
+        max_chunks = max(1, self._cfg_int("max_page_chunks", 200))
+        if len(chunks) > max_chunks:
+            raise ValueError(
+                f"词条 {title} 生成 {len(chunks)} 块，超过单页上限 {max_chunks}；"
+                "未导入，请选择更具体的词条或提高 max_page_chunks。"
+            )
 
         return ParsedPage(
             url=url,
@@ -937,11 +953,6 @@ class Main(Star):
     ) -> bool:
         async with self._kb_write_lock:
             old_doc_id = existing_docs.get(page.title)
-            updated = False
-            if old_doc_id:
-                await kb_helper.delete_document(old_doc_id)
-                updated = True
-
             doc = await kb_helper.upload_document(
                 file_name=page.title,
                 file_content=None,
@@ -951,8 +962,20 @@ class Main(Star):
                 max_retries=3,
                 pre_chunked_text=page.chunks,
             )
+            # Keep the old document until embedding/upload succeeds.
+            if old_doc_id:
+                try:
+                    await kb_helper.delete_document(old_doc_id)
+                except Exception:
+                    # Deletion can fail after partially committing. Preserve the
+                    # successfully uploaded version rather than risk losing both.
+                    existing_docs[page.title] = doc.doc_id
+                    raise RuntimeError(
+                        f"新版本已写入（{doc.doc_id}），但旧文档 {old_doc_id} 清理失败；"
+                        "请检查并清理可能残留的重复版本。"
+                    )
             existing_docs[page.title] = doc.doc_id
-            return updated
+            return bool(old_doc_id)
 
     async def _maybe_auto_bind(
         self,
@@ -1067,7 +1090,7 @@ class Main(Star):
                 kb_helper.kb.kb_name,
             )
 
-            while queue and (task.imported + task.updated + task.failed) < task.limit:
+            while queue and len(visited) < task.limit:
                 current_url = queue.popleft()
                 queued.discard(current_url)
                 if current_url in visited:
@@ -1096,6 +1119,8 @@ class Main(Star):
                             skip_reason,
                             current_url,
                         )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
                         continue
                     was_updated = await self._upsert_page(kb_helper, page, existing_docs)
                     if was_updated:
@@ -1216,6 +1241,7 @@ class Main(Star):
         if hint not in system_prompt:
             request.system_prompt = f"{system_prompt}\n{hint}\n"
 
+        context_text = ""
         try:
             kb_result = await self._retrieve_touhou_context(
                 query=query,
@@ -1237,7 +1263,15 @@ class Main(Star):
                 )
         except Exception as exc:
             logger.warning(f"注入东方知识库检索结果失败: {exc}")
-        if self._cfg_bool("remove_competing_tools", True):
+        explicit_external_request = any(
+            word in query.lower()
+            for word in ("联网", "搜索", "核验", "抓取", "抓网页", "浏览器", "python", "shell", "代码")
+        )
+        if (
+            context_text
+            and not explicit_external_request
+            and self._cfg_bool("remove_competing_tools", True)
+        ):
             self._remove_competing_tools(request)
 
     @filter.command("东方知识库初始化")
